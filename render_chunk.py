@@ -19,6 +19,7 @@ import argparse
 import base64
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,35 @@ HIDE_JS = """() => {
   document.head.appendChild(st);
   return true;
 }"""
+
+
+def is_near_black(path):
+    """True when a frame capture is a flat, near-black image.
+
+    The film fades to black over its final ~0.4 s; those frames are only ~8 KB, so
+    the MIN_IMG size guard mistakes them for failed captures.  Measure luma with
+    ffmpeg's signalstats and accept only essentially uniform black, so a blank
+    white or unpainted capture still raises.
+    """
+    try:
+        out = subprocess.run(
+            [FFMPEG, "-hide_banner", "-i", str(path),
+             "-vf", "signalstats,metadata=print", "-f", "null", "-"],
+            capture_output=True, text=True).stderr
+    except Exception:  # noqa: BLE001
+        return False
+    ymax = re.findall(r"lavfi\.signalstats\.YMAX=(\d+)", out)
+    yavg = re.findall(r"lavfi\.signalstats\.YAVG=([\d.]+)", out)
+    if not ymax or not yavg:
+        return False
+    return int(ymax[-1]) <= 24 and float(yavg[-1]) <= 24
+
+
+def frame_ok(path):
+    """Existing frame that passes the size guard, or a legitimate black frame."""
+    if not path.exists():
+        return False
+    return path.stat().st_size > MIN_IMG or is_near_black(path)
 
 
 def log(*a):
@@ -122,7 +152,7 @@ def render_range(page, frame, cdp, start, end, frames_dir, fmt, quality, budget)
     i = start
     for i in range(start, end):
         path = frame_path(frames_dir, i, ext)
-        if path.exists() and path.stat().st_size > MIN_IMG:
+        if frame_ok(path):
             continue
         if budget and time.time() - t_start > budget:
             log(f"budget reached at frame {i}")
@@ -133,7 +163,10 @@ def render_range(page, frame, cdp, start, end, frames_dir, fmt, quality, budget)
                 frame.evaluate("(t) => window.renderAt(t)", i / FPS)
                 grab(page, cdp, tmp, fmt, quality)
                 if tmp.stat().st_size < MIN_IMG:
-                    raise RuntimeError(f"tiny screenshot {tmp.stat().st_size}B")
+                    if is_near_black(tmp):
+                        log(f"  frame {i} is near-black ({tmp.stat().st_size}B), accepting")
+                    else:
+                        raise RuntimeError(f"tiny screenshot {tmp.stat().st_size}B")
                 os.replace(tmp, path)
                 break
             except Exception as exc:  # noqa: BLE001
